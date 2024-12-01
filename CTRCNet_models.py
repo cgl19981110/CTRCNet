@@ -11,12 +11,6 @@ def conv(in_channels, out_channels, kernel_size=3, stride=1, padding=1):
 def deconv(in_channels, out_channels, kernel_size=3, stride=1, groups=3, padding=1, output_padding=0):
     return nn.ConvTranspose2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=padding, output_padding=output_padding, bias=False)
 
-def conv1x1(in_channels, out_channels, stride=1, bias=False):
-    return nn.Conv2d(in_channels=in_channels, out_channels=out_channels, kernel_size=1, stride=stride, bias=bias)
-
-def deconv1x1(in_channels, out_channels, stride=1, bias=False):
-    return nn.ConvTranspose2d(in_channels=in_channels, out_channels=out_channels, kernel_size=1, stride=stride, bias=bias)
-
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class LowerBound(Function):
@@ -319,7 +313,6 @@ class LMST(BaseNetwork):
 
         return output
 
-
 class ChannelAttentionModule(nn.Module):
     def __init__(self, in_channels, reduction=2):
         super(ChannelAttentionModule, self).__init__()
@@ -383,7 +376,6 @@ class FCF(nn.Module):
 
         return lg_out
 
-
 class AF_block(nn.Module):
     def __init__(self, Nin, Nh, No):
         super(AF_block, self).__init__()
@@ -408,7 +400,6 @@ class AF_block(nn.Module):
         out = out.unsqueeze(3)
         out = out * x
         return out
-
 
 class conv_ResBlock(nn.Module):
     def __init__(self, in_channels, out_channels, use_conv1x1=False, kernel_size=3, stride=1, padding=1):
@@ -461,8 +452,6 @@ class deconv_ResBlock(nn.Module):
         elif activate_func == 'sigmoid':
             out = self.sigmoid(out)
         return out
-
-
 
 class Encoder(nn.Module):
     def __init__(self, enc_shape, kernel_sz, Nc_conv):
@@ -522,9 +511,40 @@ class Encoder(nn.Module):
 
         out = self.lc_AF(lc_out, snr)
 
-        out = self.flatten(out)    #[128,48*8*8]
+        out = self.flatten(out)
         return out
-class Decoder(nn.Module):             # The Decoder model
+
+def mask_gen(N, cr, ch_max=48):
+    MASK = torch.zeros(cr.shape[0], N).int()
+    nc = N // ch_max
+    for i in range(0, cr.shape[0]):
+        L_i = nc * torch.round(ch_max * cr[i]).int()
+        MASK[i, 0:L_i] = 1
+    return MASK
+
+class ASFM(nn.Module):
+    def __init__(self, in_channel=3072, out_channel=3072):
+
+        super(ASFM, self).__init__()
+
+        self.fc1 = nn.Linear(in_channel + 1, in_channel//2)
+        self.fc2 = nn.Linear(in_channel//2, out_channel)
+        self.relu = nn.ReLU()
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, y, snr, cr):
+        batch_size, length = y.shape
+        mask = mask_gen(length, cr).cuda()
+        y = y * mask
+        y1 = torch.cat((y, snr), 1)
+        y1 = self.fc1(y1)
+        y1 = self.relu(y1)
+        y1 = self.fc2(y1)
+        y1 = self.sigmoid(y1)
+        y = y * y1
+        return y
+
+class Decoder(nn.Module):
     def __init__(self, enc_shape, kernel_sz, Nc_deconv):
         super(Decoder, self).__init__()
         self.enc_shape = enc_shape
@@ -559,163 +579,54 @@ class Decoder(nn.Module):             # The Decoder model
 
         return out
 
-
-################################################################################
-#  AWGN and  Rayleigh Fading channel
-# Power normalization before transmission
-# Note: if P = 1, the symbol power is 2
-# If you want to set the average power as 1, please change P as P=1/np.sqrt(2)
-# ########################################################################
-def Power_norm(z, P=1):
-    batch_size, z_dim = z.shape
-    z_power = torch.sqrt(torch.sum(z ** 2, 1))
-    z_M = z_power.repeat(z_dim, 1)
-    return np.sqrt(P * z_dim) * z / z_M.t()
-
-# The (real) AWGN channel
-def AWGN_channel(x, snr, P=2):
-    batch_size, length = x.shape
-    gamma = 10 ** (snr / 10.0)
-    noise = torch.sqrt(P / gamma) * torch.randn(batch_size, length).cuda()
-    y = x + noise
-    return y
-
-# Please set the symbol power if it is not a default value
-def Fading_channel(x, snr, P=2):
-    gamma = 10 ** (snr / 10.0)
-    [batch_size, feature_length] = x.shape
-    K = feature_length // 2
-
-    h_I = torch.randn(batch_size, K).cuda()
-    h_R = torch.randn(batch_size, K).cuda()
-    h_com = torch.complex(h_I, h_R)
-    x_com = torch.complex(x[:, 0:feature_length:2], x[:, 1:feature_length:2])
-    y_com = h_com * x_com
-
-    n_I = torch.sqrt(P / gamma) * torch.randn(batch_size, K).cuda()
-    n_R = torch.sqrt(P / gamma) * torch.randn(batch_size, K).cuda()
-    noise = torch.complex(n_I, n_R)
-
-    y_add = y_com + noise
-    y = y_add / h_com
-
-    y_out = torch.zeros(batch_size, feature_length).cuda()
-    y_out[:, 0:feature_length:2] = y.real
-    y_out[:, 1:feature_length:2] = y.imag
-    return y_out
-
-
 def Channel(z, snr, channel_type='AWGN'):
-    z = Power_norm(z)
-    if channel_type == 'AWGN':
-        z = AWGN_channel(z, snr)
-    elif channel_type == 'Fading':
-        z = Fading_channel(z, snr)
-    return z
+    batch_size, length = z.shape
+    gamma = 10 ** (snr / 10.0)
 
-def one_hot_to_thermo(h):
-
-    h = torch.flip(h, [-1])
-    s = torch.cumsum(h, -1)
-    v = torch.flip(s, [-1])
-    return v
-class AFSF(nn.Module):
-    def __init__(self, in_channel=3072, out_channel=3072):
-
-        super(AFSF, self).__init__()
-
-        # Policy network
-        model = [nn.Linear(in_channel + 1, 1536),
-                 nn.ReLU(True),
-                 nn.BatchNorm1d(1536),
-                 nn.Linear(1536, 1536),
-                 nn.ReLU(True),
-                 nn.BatchNorm1d(1536),
-                 nn.Linear(1536, out_channel)]
-        self.model_gate = nn.Sequential(*model)         #  mlp
-
-    def forward(self, z, snr, temp=5):
-        # Policy/gate network
-        z1 = torch.cat((z, snr), 1)
-        z1 = self.model_gate(z1)
-        soft = nn.functional.gumbel_softmax(z1, temp, dim=-1)
-        soft_mask = one_hot_to_thermo(soft[:, :])
-        z = soft_mask * z1
-        return z
-
-
-def mask_gen(N, cr, ch_max=48):
-    MASK = torch.zeros(cr.shape[0], N).int()
-    nc = N // ch_max
-    for i in range(0, cr.shape[0]):
-        L_i = nc * torch.round(ch_max * cr[i]).int()
-        MASK[i, 0:L_i] = 1
-    return MASK
-
-def Power_norm(z, cr, P=1):  # deepjscc_V的功率归一化操作
-    batch_size, z_dim = z.shape
-    Kv = torch.ceil(z_dim * cr).int()
+    p = 1
     z_power = torch.sqrt(torch.sum(z ** 2, 1))
-    z_M = z_power.repeat(z_dim, 1).cuda()
-    return torch.sqrt(Kv * P) * z / z_M.t()
+    z_M = z_power.repeat(length, 1)
+    z = np.sqrt(p * length) * z / z_M.t()
 
-def AWGN_channel_test(x, snr, cr, P=2):
-    batch_size, length = x.shape  # .shape   返回的是几行几列，
-    gamma = 10 ** (snr / 10.0)
-    mask = mask_gen(length, cr).cuda()
-    noise = torch.sqrt(P / gamma) * torch.randn(1, length).cuda()
-    noise = noise * mask
-    y = x + noise
-    return y
-
-def Fading_channel_test(x, snr, cr, P=2):  # 衰弱信道
-    gamma = 10 ** (snr / 10.0)
-    [batch_size, feature_length] = x.shape
-    K = feature_length // 2
-
-    mask = mask_gen(K, cr).cuda()
-    h_I = torch.randn(batch_size, K).cuda()
-    h_R = torch.randn(batch_size, K).cuda()
-    h_com = torch.complex(h_I, h_R)
-    x_com = torch.complex(x[:, 0:feature_length:2], x[:, 1:feature_length:2])
-    y_com = h_com * x_com
-
-    n_I = torch.sqrt(P / gamma) * torch.randn(batch_size, K).cuda()
-    n_R = torch.sqrt(P / gamma) * torch.randn(batch_size, K).cuda()
-    noise = torch.complex(n_I, n_R) * mask
-
-    y_add = y_com + noise
-    y = y_add / h_com
-
-    y_out = torch.zeros(batch_size, feature_length).cuda()
-    y_out[:, 0:feature_length:2] = y.real
-    y_out[:, 1:feature_length:2] = y.imag
-    return y_out
-
-def Channel_Test(z, snr, cr, channel_type='AWGN'):  # 选择信道，并加入特定的信噪比的和压缩率。
-    z = Power_norm(z, cr)
     if channel_type == 'AWGN':
-        z = AWGN_channel_test(z, snr, cr)  # 自适应压缩率
+        P=2
+        noise = torch.sqrt(P / gamma) * torch.randn(batch_size, length).cuda()
+        y = z + noise
+        return y
     elif channel_type == 'Fading':
-        z = Fading_channel_test(z, snr, cr)
-    return z
+        P = 2
+        K = length // 2
+
+        h_I = torch.randn(batch_size, K).cuda()
+        h_R = torch.randn(batch_size, K).cuda()
+        h_com = torch.complex(h_I, h_R)
+        x_com = torch.complex(z[:, 0:length:2], z[:, 1:length:2])
+        y_com = h_com * x_com
+
+        n_I = torch.sqrt(P / gamma) * torch.randn(batch_size, K).cuda()
+        n_R = torch.sqrt(P / gamma) * torch.randn(batch_size, K).cuda()
+        noise = torch.complex(n_I, n_R)
+
+        y_add = y_com + noise
+        y = y_add / h_com
+
+        y_out = torch.zeros(batch_size, length).cuda()
+        y_out[:, 0:length:2] = y.real
+        y_out[:, 1:length:2] = y.imag
+        return y_out
 
 
-# The CTRCNet model
 class CTRCNet(nn.Module):
-    def __init__(self, enc_shape, Kernel_sz, Nc):  # （[48,8,8],5,256）
+    def __init__(self, enc_shape, Kernel_sz, Nc):
         super(CTRCNet, self).__init__()
         self.encoder = Encoder(enc_shape, Kernel_sz, Nc)
-        self.p = AFSF(in_channel=3072, out_channel=3072)
+        self.asfm = ASFM(in_channel=3072, out_channel=3072)
         self.decoder = Decoder(enc_shape, Kernel_sz, Nc)
 
-    def forward(self, x, snr, cr = "null" , channel_type='AWGN'):
-        z = self.encoder(x, snr)                       #[128,3072]
-        z = self.p(z, snr)
-        if cr == "null":
-            z = Channel(z, snr, channel_type)
-        else :
-            z = Channel_Test(z, snr, cr, channel_type)
+    def forward(self, x, snr, cr, channel_type='AWGN'):
+        z = self.encoder(x, snr)
+        z = self.asfm(z, snr, cr)
+        z = Channel(z, snr, channel_type)
         out = self.decoder(z, snr)
         return out
 
@@ -728,14 +639,4 @@ if __name__ == '__main__':
     SNR_TRAIN = torch.randint(0, 28, (x_input.shape[0], 1)).cuda()
     CR = 0.1 + 0.9 * torch.rand(x_input.shape[0], 1).cuda()
     model = CTRCNet(enc_shape, 5, 256).to(device)
-    o = model(x_input, SNR_TRAIN, CR)
-
-
-
-
-
-
-
-
-
-
+    o = model(x_input, SNR_TRAIN, CR, "AWGN")
